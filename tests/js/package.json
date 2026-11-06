@@ -1,0 +1,16 @@
+{
+  "name": "byte-stream-rs-interop",
+  "private": true,
+  "description": "npm hyperblobs writer driven by tests/server.rs",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "compact-encoding": "3.5.2",
+    "hypercore": "11.40.3",
+    "hypercore-crypto": "3.7.0",
+    "hypercore-id-encoding": "1.3.0",
+    "hyperblobs": "2.13.0",
+    "hyperdht": "6.36.0",
+    "hyperswarm": "4.17.2",
+    "z32": "1.1.0"
+  }
+}
