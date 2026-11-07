@@ -38,8 +38,8 @@ use crate::{ByteStream, StreamOptions};
 /// PearTube's default window: 96 MiB ahead of the HTTP cursor.
 pub const DEFAULT_WINDOW_BYTES: u64 = 96 * 1024 * 1024;
 
-/// Frames the stream may run ahead of hyper, like the JS stream's backpressure.
-const FRAMES: usize = 8;
+/// Four 512 KiB PearTube blocks match the JS stream's 2 MiB high-water mark.
+const FRAMES: usize = 4;
 
 /// What a resolver hands back for a requested key.
 pub struct Resolved {
@@ -115,6 +115,20 @@ pub struct BlobServer {
 
 impl BlobServer {
     pub async fn bind(addr: SocketAddr, opts: ServerOptions, resolve: Resolve) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let listener = {
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket.set_reuseaddr(true)?;
+            // One video block fits without repeated partial writes on loopback.
+            socket.set_send_buffer_size(512 * 1024)?;
+            socket.bind(addr)?;
+            socket.listen(1024)?
+        };
+        #[cfg(not(target_os = "macos"))]
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let shared = Arc::new(Shared {

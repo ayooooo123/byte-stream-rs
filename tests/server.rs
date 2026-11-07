@@ -65,6 +65,7 @@ struct Http {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    first_body: Duration,
 }
 
 impl Http {
@@ -77,6 +78,7 @@ impl Http {
 }
 
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, range: Option<&str>) -> Http {
+    let started = std::time::Instant::now();
     let mut s = TcpStream::connect(addr).await.unwrap();
     let range = range.map(|r| format!("Range: {r}\r\n")).unwrap_or_default();
     s.write_all(
@@ -85,11 +87,27 @@ async fn http(addr: std::net::SocketAddr, method: &str, path: &str, range: Optio
     )
     .await
     .unwrap();
-    let mut raw = vec![];
-    timeout(Duration::from_secs(60), s.read_to_end(&mut raw))
-        .await
-        .expect("response")
-        .unwrap();
+    let (raw, first_body) = timeout(Duration::from_secs(60), async {
+        let mut input = BufReader::new(s);
+        let mut raw = Vec::new();
+        loop {
+            assert!(
+                input.read_until(b'\n', &mut raw).await.unwrap() > 0,
+                "header end"
+            );
+            if raw.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let mut first = [0];
+        let count = input.read(&mut first).await.unwrap();
+        let first_body = started.elapsed();
+        raw.extend_from_slice(&first[..count]);
+        input.read_to_end(&mut raw).await.unwrap();
+        (raw, first_body)
+    })
+    .await
+    .expect("response");
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -112,6 +130,7 @@ async fn http(addr: std::net::SocketAddr, method: &str, path: &str, range: Optio
         status,
         headers,
         body: raw[split + 4..].to_vec(),
+        first_body,
     }
 }
 
@@ -237,6 +256,22 @@ async fn serves_js_blobs_over_udx_and_leaks_nothing_on_abort() {
         .enumerate()
         .map(|(i, (id, _))| blob(i as u64, id.byte_length as usize))
         .collect();
+    // A one-byte seek still needs its uncached 512 KiB block and Merkle path.
+    let offset = 4 * 512 * 1024 + 123;
+    assert!(!core.has(4));
+    let seek = http(
+        addr,
+        "GET",
+        &path(&key_z32, &blobs[0].1, &token),
+        Some(&format!("bytes={offset}-{offset}")),
+    )
+    .await;
+    assert_eq!(seek.status, 206);
+    assert_eq!(seek.body, expected[0][offset..=offset]);
+    eprintln!(
+        "PERF uncached-seek {:.3} ms",
+        seek.first_body.as_secs_f64() * 1000.0
+    );
     let mut rng = Lcg(42);
     for ((id, z), want) in blobs.iter().zip(&expected) {
         let p = path(&key_z32, z, &token);
