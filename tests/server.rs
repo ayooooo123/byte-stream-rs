@@ -342,15 +342,16 @@ async fn serves_js_blobs_over_udx_and_leaks_nothing_on_abort() {
             .unwrap();
         socks.push(s);
     }
+    // Every one of the 80 streams must be registered before the abort, or the
+    // one still being accepted escapes it and hangs on a cleared block forever.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while core.pending_requests().await < 80 {
+    while server.active_streams() < 80 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "requests never reached the core"
+            "requests never reached the server"
         );
         sleep(Duration::from_millis(20)).await;
     }
-    assert!(server.active_streams() >= 40);
     // Abort without touching the sockets: both halves must be cut off anyway,
     // the ones stuck in seek before their headers and the ones mid-body whose
     // clients stopped reading (hyper never polls those bodies again).
