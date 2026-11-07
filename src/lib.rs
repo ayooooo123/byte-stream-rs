@@ -8,7 +8,7 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use hyperblobs::BlobId;
-use hypercore::{Core, CoreError, GetOptions, Session};
+use hypercore::{Core, CoreError, GetOptions, RequestBag, Session};
 
 pub use hyperblobs;
 
@@ -50,6 +50,7 @@ struct Window {
 /// Yields the requested bytes as zero-copy slices of the core's blocks.
 pub struct ByteStream {
     session: Session,
+    bag: RequestBag,
     index: u64,
     relative: usize,
     remaining: u64,
@@ -59,7 +60,14 @@ pub struct ByteStream {
 }
 
 impl ByteStream {
-    pub async fn open(core: &Core, id: BlobId, opts: StreamOptions) -> Result<Self, CoreError> {
+    /// `bag` cancels every block and range request this stream makes, from
+    /// anywhere; dropping the stream only cancels them at its next poll.
+    pub async fn open(
+        core: &Core,
+        id: BlobId,
+        opts: StreamOptions,
+        bag: RequestBag,
+    ) -> Result<Self, CoreError> {
         let session = core.session(opts.active);
         let start = opts.start;
         let remaining = id
@@ -68,6 +76,7 @@ impl ByteStream {
             .min(opts.length.unwrap_or(u64::MAX));
         let mut s = Self {
             session,
+            bag,
             index: id.block_offset,
             relative: 0,
             remaining,
@@ -142,9 +151,12 @@ impl ByteStream {
             return;
         }
         // Register the overlapping next window before the old one is cancelled.
-        let prev = w
-            .range
-            .replace(Box::pin(self.session.download(cur, Some(next), true)));
+        let prev = w.range.replace(Box::pin(self.session.download_with_bag(
+            cur,
+            Some(next),
+            true,
+            self.bag.clone(),
+        )));
         w.dl_end = next;
         drop(prev);
     }
@@ -158,7 +170,13 @@ impl ByteStream {
         self.advance_window();
         let mut block = self
             .session
-            .get(self.index, GetOptions::default())
+            .get(
+                self.index,
+                GetOptions {
+                    bag: Some(self.bag.clone()),
+                    ..Default::default()
+                },
+            )
             .await?
             .ok_or(CoreError::NotFound)?;
         if self.relative > 0 {

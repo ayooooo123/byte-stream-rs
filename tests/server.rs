@@ -2,6 +2,7 @@
 //! through HyperDHT/UDX, exact bytes for random ranges, 206/416 edges, and
 //! nothing left running after 80 concurrent aborted requests.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use std::time::Duration;
 
 use byte_stream::server::{BlobServer, Resolve, Resolved, ServerOptions};
 use hyperblobs::BlobId;
+use hypercore::crypto::KeyPair;
 use hypercore::storage::Store;
 use hypercore::{Core, CoreOptions};
 use peeroxide::{JoinOpts, SwarmConfig, spawn};
@@ -201,20 +203,19 @@ async fn serves_js_blobs_over_udx_and_leaks_nothing_on_abort() {
     let mut client = JoinOpts::default();
     client.server = false;
     swarm.join(dk, client).await.unwrap();
-    {
-        let _s = core.session(true);
-        assert!(
-            timeout(Duration::from_secs(60), core.update(None))
-                .await
-                .expect("found the JS peer")
-                .unwrap()
-        );
-    }
+    // Kept for the whole test: the last session closing would close the core.
+    let session = core.session(true);
+    assert!(
+        timeout(Duration::from_secs(60), session.update(None))
+            .await
+            .expect("found the JS peer")
+            .unwrap()
+    );
 
     let resolve_core = core.clone();
     let resolve: Resolve = Arc::new(move |k| {
-        let core = (k == *resolve_core.key()).then(|| resolve_core.clone());
-        Box::pin(async move { core.map(|core| Resolved { core, active: true }) })
+        let session = (k == *resolve_core.key()).then(|| resolve_core.session(true));
+        Box::pin(async move { session.map(|session| Resolved { session }) })
     });
     // A small window so the sliding prefetch actually slides.
     let opts = ServerOptions {
@@ -350,8 +351,11 @@ async fn serves_js_blobs_over_udx_and_leaks_nothing_on_abort() {
         sleep(Duration::from_millis(20)).await;
     }
     assert!(server.active_streams() >= 40);
-    drop(socks);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Abort without touching the sockets: both halves must be cut off anyway,
+    // the ones stuck in seek before their headers and the ones mid-body whose
+    // clients stopped reading (hyper never polls those bodies again).
+    server.abort_streams(None, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         let pending = core.pending_requests().await;
         let (streams, sessions) = (server.active_streams(), core.session_count());
@@ -362,7 +366,114 @@ async fn serves_js_blobs_over_udx_and_leaks_nothing_on_abort() {
             tokio::time::Instant::now() < deadline,
             "leaked: {pending} requests, {streams} streams, {sessions} sessions"
         );
-        sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(10)).await;
     }
+    assert!(server.streaming_keys().is_empty());
+    drop(socks);
+    server.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn abort_stops_only_the_given_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let open = |seed| {
+        Core::open(
+            &store,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[seed; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let (a, b) = (open(11), open(12));
+    // Kept alive: a resolver hands out one session per request.
+    let (_sa, _sb) = (a.session(true), b.session(true));
+    let (ka, kb) = (*a.key(), *b.key());
+    let (ra, rb) = (a.clone(), b.clone());
+    let resolve: Resolve = Arc::new(move |k| {
+        let core = if k == ka {
+            Some(ra.clone())
+        } else if k == kb {
+            Some(rb.clone())
+        } else {
+            None
+        };
+        Box::pin(async move {
+            core.map(|core| Resolved {
+                session: core.session(true),
+            })
+        })
+    });
+    let opts = ServerOptions {
+        token: None,
+        ..Default::default()
+    };
+    let server = BlobServer::bind("127.0.0.1:0".parse().unwrap(), opts, resolve)
+        .await
+        .unwrap();
+    let addr = server.local_addr();
+    let blob = BlobId {
+        block_offset: 0,
+        block_length: 4096,
+        byte_offset: 0,
+        byte_length: 1 << 20,
+    };
+    let z = hypercore_id_encoding::z32::encode(&compact_encoding::encode(&blob));
+    // Neither core has blocks or peers: both requests wait until they are cut.
+    let mut socks = vec![];
+    for key in [ka, kb] {
+        let p = path(&hypercore_id_encoding::encode(&key), &z, "");
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {p} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        socks.push(s);
+    }
+    // Each request: one session handed by the resolver, one for its stream.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while a.session_count() != 2 || b.session_count() != 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "requests never opened"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.active_streams(), 2);
+
+    server.abort_streams(Some(ka), None);
+    assert_eq!(server.streaming_keys(), HashSet::from([kb]));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let (pending, sessions) = (a.pending_requests().await, a.session_count());
+        if pending == 0 && sessions == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leaked on the aborted key: {pending} requests, {sessions} sessions"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(b.session_count(), 2);
+    assert!(b.pending_requests().await > 0);
+    assert_eq!(server.active_streams(), 1);
+
+    server.abort_streams(None, None);
+    assert_eq!(server.active_streams(), 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let (pending, sessions) = (b.pending_requests().await, b.session_count());
+        if pending == 0 && sessions == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leaked on the other key: {pending} requests, {sessions} sessions"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    drop(socks);
     server.close().await;
 }

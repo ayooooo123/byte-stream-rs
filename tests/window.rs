@@ -7,7 +7,7 @@ use byte_stream::{ByteStream, StreamOptions};
 use hyperblobs::Blobs;
 use hypercore::crypto::KeyPair;
 use hypercore::storage::Store;
-use hypercore::{Core, CoreOptions};
+use hypercore::{Core, CoreOptions, RequestBag};
 use protomux::{Mux, StreamInfo, memory};
 use tokio::time::{sleep, timeout};
 
@@ -63,15 +63,14 @@ async fn window_slides_with_the_reader_and_closes_with_it() {
     let (ma, mb) = link();
     writer.replicate(&ma);
     reader.replicate(&mb);
-    {
-        let _s = reader.session(true);
-        assert!(
-            timeout(Duration::from_secs(10), reader.update(None))
-                .await
-                .unwrap()
-                .unwrap()
-        );
-    }
+    // Kept alive: with no other session the physical core would close.
+    let session = reader.session(true);
+    assert!(
+        timeout(Duration::from_secs(10), session.update(None))
+            .await
+            .unwrap()
+            .unwrap()
+    );
 
     let start = 50 * BLOCK as u64 + 5;
     let opts = StreamOptions {
@@ -80,7 +79,9 @@ async fn window_slides_with_the_reader_and_closes_with_it() {
         window_bytes: 16 * BLOCK as u64,
         active: true,
     };
-    let mut s = ByteStream::open(&reader, id, opts).await.unwrap();
+    let mut s = ByteStream::open(&reader, id, opts, RequestBag::new())
+        .await
+        .unwrap();
     assert_eq!(s.window(), Some((50, 66)));
     until("the first window", || reader.has_range(50, 66)).await;
     sleep(Duration::from_millis(100)).await;
@@ -115,6 +116,7 @@ async fn window_slides_with_the_reader_and_closes_with_it() {
             window_bytes: 1 << 20,
             ..Default::default()
         },
+        RequestBag::new(),
     )
     .await
     .unwrap();
@@ -122,6 +124,14 @@ async fn window_slides_with_the_reader_and_closes_with_it() {
     let sessions = reader.session_count();
     s.next().await.unwrap();
     drop(s);
-    assert_eq!(reader.pending_requests().await, 0);
+    // The window's task is cancelled off-thread, so it goes away a turn later.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reader.pending_requests().await > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "requests outlived the stream"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(reader.session_count(), sessions - 1);
 }

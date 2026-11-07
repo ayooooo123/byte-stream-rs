@@ -1,12 +1,14 @@
 //! HTTP Range server for blobs, link- and response-compatible with PearTube's
 //! `src/blob-server.js`: `/?key=<id>&blob=<z32 blob id>&type=<mime>&token=<t>`.
 //!
-//! Every request owns one core session and at most one download window.
-//! When the client goes away hyper drops the body, which drops the stream,
-//! its session and its window, so nothing keeps downloading.
+//! A request is registered before it opens, with a request bag and an abort
+//! signal, then served by its own task: the task owns the core session and the
+//! download window and feeds hyper frames through a bounded channel. Aborting
+//! cancels the bag and that task, so the session and window die even when the
+//! client stopped reading and hyper never polls the body again.
 //!
 //! Not ported: `anyPort` fallback (callers bind), `resolve` returning only a
-//! key (the resolver hands back an opened core).
+//! key (the resolver hands back an open session).
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -18,29 +20,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::stream::unfold;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use hyperblobs::BlobId;
-use hypercore::{Core, CoreError};
+use hypercore::{CoreError, RequestBag, Session};
 use hypercore_id_encoding::z32;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{ByteStream, StreamOptions};
 
 /// PearTube's default window: 96 MiB ahead of the HTTP cursor.
 pub const DEFAULT_WINDOW_BYTES: u64 = 96 * 1024 * 1024;
 
+/// Frames the stream may run ahead of hyper, like the JS stream's backpressure.
+const FRAMES: usize = 8;
+
 /// What a resolver hands back for a requested key.
 pub struct Resolved {
-    pub core: Core,
-    /// `false`: serve without prefetching (and with a passive session).
-    pub active: bool,
+    /// Keeps the core open for the whole request; its active flag decides
+    /// whether the response prefetches.
+    pub session: Session,
 }
 
 pub type ResolveFuture = Pin<Box<dyn Future<Output = Option<Resolved>> + Send>>;
@@ -63,9 +68,34 @@ impl Default for ServerOptions {
     }
 }
 
+/// One registered request: everything needed to cut it off without a poll.
 struct Active {
     key: [u8; 32],
+    bag: RequestBag,
     abort: Option<oneshot::Sender<()>>,
+    // Opening the stream, then pumping it: the task whose abort drops both.
+    task: Option<JoinHandle<()>>,
+}
+
+impl Active {
+    /// Cancels every core request the stream waits on, ends an `open` still
+    /// seeking, and drops the stream's session and window.
+    fn stop(&mut self) {
+        self.bag.destroy("stream aborted");
+        if let Some(abort) = self.abort.take() {
+            let _ = abort.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Removes a request and cuts it off, in whatever state it reached.
+fn unregister(shared: &Shared, id: u64) {
+    if let Some(mut a) = shared.streams.lock().unwrap().remove(&id) {
+        a.stop();
+    }
 }
 
 struct Shared {
@@ -143,19 +173,22 @@ impl BlobServer {
     }
 
     /// Cuts streams (of `only`, or all but `except`) off at once, e.g.
-    /// before their blocks are cleared.
+    /// before their blocks are cleared. Their requests are cancelled and their
+    /// sessions and windows dropped immediately; the sockets stay open.
     pub fn abort_streams(&self, only: Option<[u8; 32]>, except: Option<[u8; 32]>) {
         let mut streams = self.shared.streams.lock().unwrap();
-        for a in streams.values_mut() {
+        streams.retain(|_, a| {
             if only.is_some_and(|k| k != a.key) || except == Some(a.key) {
-                continue;
+                return true;
             }
-            a.abort.take();
-        }
+            a.stop();
+            false
+        });
     }
 
     /// Stops accepting, drops every connection and stream.
     pub async fn close(self) {
+        self.abort_streams(None, None);
         self.accept.abort();
         let _ = self.accept.await;
     }
@@ -323,7 +356,8 @@ async fn serve(
     let body = if head || length == 0 {
         Empty::new().map_err(|e| match e {}).boxed_unsync()
     } else {
-        let window_bytes = if resolved.active && q.blob.block_length > 0 {
+        let active = resolved.session.is_active();
+        let window_bytes = if active && q.blob.block_length > 0 {
             shared.window_bytes
         } else {
             0
@@ -332,11 +366,42 @@ async fn serve(
             start,
             length: Some(length),
             window_bytes,
-            active: resolved.active,
+            active,
         };
-        match ByteStream::open(&resolved.core, q.blob, opts).await {
-            Ok(s) => body(shared, q.key, start, s),
-            Err(_) => return empty(StatusCode::NOT_FOUND),
+        // Registered before the stream opens, so an abort reaches a request
+        // still waiting for peers inside `open`: `stop` aborts the opening task.
+        let id = shared.next.fetch_add(1, Ordering::Relaxed);
+        let bag = RequestBag::new();
+        let (abort, mut aborted) = oneshot::channel();
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let core = resolved.session.core().clone();
+        let opening = tokio::spawn({
+            let bag = bag.clone();
+            async move {
+                let _ = opened_tx.send(ByteStream::open(&core, q.blob, opts, bag).await);
+            }
+        });
+        shared.streams.lock().unwrap().insert(
+            id,
+            Active {
+                key: q.key,
+                bag,
+                abort: Some(abort),
+                task: Some(opening),
+            },
+        );
+        let opened = tokio::select! {
+            biased;
+            _ = &mut aborted => None,
+            opened = opened_rx => opened.ok(),
+        };
+        match opened {
+            Some(Ok(stream)) => body(shared, id, q.key, start, stream),
+            // Aborted while opening, or no such block: either way it is done.
+            _ => {
+                unregister(&shared, id);
+                return empty(StatusCode::NOT_FOUND);
+            }
         }
     };
 
@@ -376,59 +441,59 @@ struct Registered {
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        self.shared.streams.lock().unwrap().remove(&self.id);
+        unregister(&self.shared, self.id);
     }
 }
 
-struct BodyState {
-    stream: ByteStream,
-    aborted: oneshot::Receiver<()>,
-    key: [u8; 32],
-    served: u64,
-    _reg: Registered,
+fn body(shared: Arc<Shared>, id: u64, key: [u8; 32], start: u64, stream: ByteStream) -> Body {
+    let (tx, rx) = mpsc::channel(FRAMES);
+    let pump = tokio::spawn(pump(shared.clone(), tx, key, start, stream));
+    match shared.streams.lock().unwrap().get_mut(&id) {
+        Some(active) => active.task = Some(pump),
+        // Aborted while opening: a body that feeds nothing must fetch nothing.
+        None => {
+            pump.abort();
+            return Empty::new().map_err(|e| match e {}).boxed_unsync();
+        }
+    }
+    let frames = unfold(
+        (rx, Registered { shared, id }),
+        |(mut rx, reg)| async move { rx.recv().await.map(|f| (f, (rx, reg))) },
+    );
+    StreamBody::new(frames).boxed_unsync()
 }
 
-fn body(shared: Arc<Shared>, key: [u8; 32], start: u64, stream: ByteStream) -> Body {
-    let id = shared.next.fetch_add(1, Ordering::Relaxed);
-    let (abort, aborted) = oneshot::channel();
-    shared.streams.lock().unwrap().insert(
-        id,
-        Active {
-            key,
-            abort: Some(abort),
-        },
-    );
-    let state = BodyState {
-        stream,
-        aborted,
-        key,
-        served: start,
-        _reg: Registered {
-            shared: shared.clone(),
-            id,
-        },
-    };
-    let frames = stream::unfold(Some(state), |state| async move {
-        let mut s = state?;
-        let next = tokio::select! {
-            _ = &mut s.aborted => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stream aborted")),
-            n = s.stream.next() => n.map_err(core_err),
-        };
-        match next {
+/// Pulls the stream into the body's channel. hyper polls the body, never this:
+/// aborting the task is what cancels the requests still in flight.
+async fn pump(
+    shared: Arc<Shared>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    key: [u8; 32],
+    start: u64,
+    mut stream: ByteStream,
+) {
+    let mut served = start;
+    loop {
+        match stream.next().await {
             Ok(Some(chunk)) => {
-                s.served += chunk.len() as u64;
-                let mut progress = s._reg.shared.progress.lock().unwrap();
-                let p = progress.entry(s.key).or_insert(0);
-                *p = (*p).max(s.served);
-                drop(progress);
-                Some((Ok(Frame::data(chunk)), Some(s)))
+                served += chunk.len() as u64;
+                {
+                    let mut progress = shared.progress.lock().unwrap();
+                    let p = progress.entry(key).or_insert(0);
+                    *p = (*p).max(served);
+                }
+                if tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                    return;
+                }
             }
-            Ok(None) => None,
+            Ok(None) => return,
             // Error out once: hyper then closes the connection.
-            Err(e) => Some((Err(e), None)),
+            Err(e) => {
+                let _ = tx.send(Err(core_err(e))).await;
+                return;
+            }
         }
-    });
-    StreamBody::new(frames).boxed_unsync()
+    }
 }
 
 fn core_err(e: CoreError) -> io::Error {
