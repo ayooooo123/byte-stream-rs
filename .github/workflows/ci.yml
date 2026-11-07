@@ -56,7 +56,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: for d in tests/js fixtures/gen; do [ -f $d/package.json ] && (cd $d && npm ci); done; true
+      - run: for d in tests/js fixtures/gen ../hypercore-rs/tests/js; do [ -f $d/package.json ] && (cd $d && npm ci); done; true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -- --include-ignored
