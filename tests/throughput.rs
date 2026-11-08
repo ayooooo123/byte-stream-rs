@@ -50,9 +50,22 @@ async fn read_http(server: &BlobServer, path: &str, buf: &mut [u8]) -> u64 {
     received
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "cached HTTP throughput benchmark, run in release mode"]
-async fn cached_http_ranges() {
+fn cached_http_ranges() {
+    let workers = std::env::var("STREAM_WORKERS")
+        .unwrap_or_else(|_| "4".into())
+        .parse()
+        .unwrap();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(cached_ranges(workers));
+}
+
+async fn cached_ranges(workers: usize) {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let core = Core::open(
@@ -79,34 +92,54 @@ async fn cached_http_ranges() {
         let session = (key == *reader.key()).then(|| reader.session(false));
         Box::pin(async move { session.map(|session| Resolved { session }) })
     });
-    let server = BlobServer::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        ServerOptions::default(),
-        resolve,
-    )
-    .await
-    .unwrap();
+    let server = Arc::new(
+        BlobServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerOptions::default(),
+            resolve,
+        )
+        .await
+        .unwrap(),
+    );
     let url = server.link(core.key(), &id, "application/octet-stream");
     let path = url
         .strip_prefix(&format!("http://{}", server.local_addr()))
-        .unwrap();
+        .unwrap()
+        .to_owned();
     let cpu = cpu_seconds();
     eprintln!("TRANSFER pid={}", std::process::id());
     let started = Instant::now();
+    let readers: usize = std::env::var("STREAM_READERS")
+        .unwrap_or_else(|_| "4".into())
+        .parse()
+        .unwrap();
+    assert!(readers > 0);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..readers {
+        let server = server.clone();
+        let path = path.clone();
+        tasks.spawn(async move {
+            let mut buf = vec![0; 1024 * 1024];
+            let mut bytes = 0;
+            for _ in 0..8 {
+                let received = read_http(&server, &path, &mut buf).await;
+                assert_eq!(received, id.byte_length - 1);
+                bytes += received;
+            }
+            bytes
+        });
+    }
     let mut bytes = 0u64;
-    let mut buf = vec![0; 1024 * 1024];
-    for _ in 0..32 {
-        let received = read_http(&server, path, &mut buf).await;
-        assert_eq!(received, id.byte_length - 1);
-        bytes += received;
+    while let Some(result) = tasks.join_next().await {
+        bytes += result.unwrap();
     }
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "PERF cached-http {:.2} MiB/s {:.2} combined CPU-s/GiB",
+        "PERF cached-http workers={workers} readers={readers} elapsed_s={seconds:.3} {:.2} MiB/s {:.2} combined CPU-s/GiB",
         bytes as f64 / 1048576.0 / seconds,
         (cpu_seconds() - cpu) / (bytes as f64 / 1073741824.0)
     );
-    server.close().await;
+    Arc::into_inner(server).unwrap().close().await;
 }
 
 fn node(
@@ -234,13 +267,14 @@ async fn uncached_http(js: bool) {
         let session = (key == *reader.key()).then(|| reader.session(true));
         Box::pin(async move { session.map(|session| Resolved { session }) })
     });
-    let server = BlobServer::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        ServerOptions::default(),
-        resolve,
-    )
-    .await
-    .unwrap();
+    let mut options = ServerOptions::default();
+    if let Ok(bytes) = std::env::var("STREAM_WINDOW_BYTES") {
+        options.window_bytes = bytes.parse().unwrap();
+    }
+    let window_bytes = options.window_bytes;
+    let server = BlobServer::bind("127.0.0.1:0".parse().unwrap(), options, resolve)
+        .await
+        .unwrap();
     let url = server.link(core.key(), &id, "application/octet-stream");
     let path = url
         .strip_prefix(&format!("http://{}", server.local_addr()))
@@ -256,7 +290,7 @@ async fn uncached_http(js: bool) {
     let seconds = started.elapsed().as_secs_f64();
     assert_eq!(received, id.byte_length - 1);
     eprintln!(
-        "PERF {}->rust-http {:.2} MiB/s {:.2} combined native CPU-s/GiB",
+        "PERF {}->rust-http window_bytes={window_bytes} {:.2} MiB/s {:.2} combined native CPU-s/GiB",
         if js { "js" } else { "rust" },
         received as f64 / 1048576.0 / seconds,
         (cpu_seconds() - cpu) * 1073741824.0 / received as f64

@@ -51,16 +51,33 @@ blocks, then aborts 80 concurrent requests over sockets it never reads, half stu
 half mid-body, and checks that no requests, streams or sessions remain.
 
 `cargo test --release --test throughput -- --ignored --nocapture` measures cached
-Range serving with a bounded-memory client (256 MiB core, 32 reads, four runtime
-workers). On this Apple Silicon Mac, three-run medians improved from 595 to
-799 MiB/s and 1.13 to 1.03 combined server/client CPU-seconds per GiB with the
-four-frame queue and macOS send buffer. Sampling showed kernel `writev`, not
-userspace `memmove`, dominated. The JS server test also reports first-body-byte
-latency for a one-byte seek into an uncached 512 KiB block.
+Range serving with bounded-memory clients (256 MiB core, four concurrent readers
+making eight reads each). `STREAM_WORKERS` selects runtime workers (default 4);
+`STREAM_READERS` selects readers (default 4). Three-run Apple Silicon release
+medians with four readers: 1 worker 1,128 MiB/s and 0.85 combined server/client
+CPU-seconds/GiB; 4 workers 1,365 MiB/s and 1.61 CPU-seconds/GiB. More workers
+improve this loopback workload's throughput, not its CPU efficiency; no extra
+pool is needed. Whole-process peak RSS was 260–282 MiB with one worker and
+230–261 MiB with four, including RocksDB, fixture creation and client buffers.
+Each client allocates 1 MiB. The server channel holds four blocks, with another
+block possibly waiting to enter it and one being sent; these are shared `Bytes`,
+not per-chunk payload copies. The 96 MiB window is a storage request range,
+not a second body buffer. No queue or window default was changed.
+The JS server test also reports first-body-byte latency for a one-byte seek
+into an uncached 512 KiB block.
 The same benchmark target also measures a fresh 256 MiB HTTP stream from a Rust
 or npm Hypercore peer over an isolated HyperDHT testnet (requires the sibling
 `hypercore-rs/tests/js` dependencies). CPU includes the native HTTP client and
 server; Rust-to-Rust also includes its in-process seeder.
+
+`STREAM_WINDOW_BYTES=0` disables prefetch in the uncached benchmarks only.
+For a Rust seeder and fresh Rust receiver (256 MiB, four workers), three-run
+release medians were 23.63 MiB/s and 240.3 MiB process peak RSS without prefetch,
+versus 33.47 MiB/s and 287.6 MiB RSS with the default 96 MiB window. Combined
+native CPU was 61.32 versus 63.92 s/GiB. Disabling the window was rejected:
+it cut throughput by 29%. The window is not a 96 MiB body allocation, but
+RocksDB and replication buffering still increased this workload's process
+peak by about 47 MiB; the process includes both Rust peers and the HTTP client.
 
 ## License
 
